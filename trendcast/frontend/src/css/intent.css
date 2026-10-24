@@ -1,0 +1,44 @@
+.intent {
+  margin-top: 1rem;
+  padding: 1rem 1.25rem;
+  border-radius: 12px;
+  background: var(--panel);
+  text-align: left;
+}
+
+.intent .label {
+  color: var(--muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 0.4rem;
+}
+
+.intent .topic {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin-bottom: 0.6rem;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.chip {
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(91, 157, 255, 0.15);
+  color: var(--accent);
+  font-size: 0.85rem;
+}
+
+.chip.time {
+  background: rgba(139, 149, 163, 0.18);
+  color: var(--muted);
+}
+
+.intent .unsupported {
+  line-height: 1.5;
+}
