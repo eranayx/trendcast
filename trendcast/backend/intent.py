@@ -26,7 +26,6 @@ Classify into exactly one "kind":
      reddit = community discussion, youtube = popular videos and creators,
      instagram = popular posts and reels.
    - If the user names a supported platform ("on Instagram"), use it. Otherwise use {json.dumps(DEFAULT_SOURCES)}.
-     Only add instagram when the user names it (it is slow).
    - "topic" is a short noun phrase (for example "AI agents" or "Rust"), or "general tech" if none given.
    - "timeframe": "today" for today, now, latest or right now; "month" for month; otherwise "week".
    - If they also greet you ("hi, what's new in AI?"), still use "trends". Set "reply" to "".
