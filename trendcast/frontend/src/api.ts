@@ -5,9 +5,8 @@ export interface SttResult {
     ms: number;
 }
 
-export type Source = "hackernews" | "reddit" | "github" | "producthunt";
+export type Source = "reddit" | "youtube" | "tiktok" | "instagram";
 export type Timeframe = "today" | "week" | "month";
-
 export type IntentKind = "trends" | "smalltalk" | "offtopic";
 
 export interface Intent {
@@ -19,7 +18,32 @@ export interface Intent {
     timeframe: Timeframe;
     /** Spoken reply for smalltalk and offtopic; empty for trends. */
     reply: string;
-    /** Server-side time spent waiting on o4-mini, in ms. */
+    /** Server-side time spent waiting on LLM, in ms. */
+    ms: number;
+}
+
+export interface TrendItem {
+    source: Source;
+    title: string;
+    url: string | null;
+    score: number | null;
+    /** What the score means for this source, e.g. "points", "upvotes", "stars gained". */
+    score_label: string;
+    comments: number | null;
+    description: string;
+}
+
+export interface SourceResult {
+    source: Source;
+    cached: boolean;
+    items: TrendItem[];
+}
+
+export interface Trends {
+    sources: SourceResult[];
+    /** Sources that failed, keyed by source name, with a readable reason. */
+    errors: Record<string, string>;
+    /** Server-side time spent fetching, in ms. */
     ms: number;
 }
 
@@ -57,5 +81,19 @@ export function parseIntent(text: string): Promise<Intent> {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
+    });
+}
+
+export function fetchTrends(
+    intent: Pick<Intent, "sources" | "topic" | "timeframe">,
+): Promise<Trends> {
+    return request<Trends>("/api/trends", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            sources: intent.sources,
+            topic: intent.topic,
+            timeframe: intent.timeframe,
+        }),
     });
 }

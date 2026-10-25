@@ -8,7 +8,7 @@ export interface Recording {
 const MIME_CANDIDATES = [
     "audio/webm;codecs=opus",
     "audio/webm",
-    "audio/mp4",
+    "audio/mp4; codecs=mp4a.40.2",
     "audio/ogg;codecs=opus",
 ];
 
@@ -46,6 +46,7 @@ export function useRecorder() {
                         channelCount: 1,
                         echoCancellation: true,
                         noiseSuppression: true,
+                        autoGainControl: true,
                     },
                 });
             }

@@ -1,4 +1,5 @@
 import intent as intent_stage
+import trends_data
 import cartesia_stt
 from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
@@ -7,7 +8,7 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -21,7 +22,8 @@ if not os.getenv("CARTESIA_API_KEY"):
     print("WARNING: CARTESIA_API_KEY is not set. Copy .env.example to .env and fill it in.")
 if not os.getenv("LLM_API_KEY"):
     print("WARNING: LLM_API_KEY is not set. /api/intent will fail until you add it to .env.")
-
+if not os.getenv("APIFY_TOKEN"):
+    print("WARNING: APIFY_TOKEN is not set. /api/trends will fail until you add it to .env.")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -48,6 +50,7 @@ async def health() -> Any:
         "ok": True,
         "cartesiaKeySet": bool(os.getenv("CARTESIA_API_KEY")),
         "llmKeySet": bool(os.getenv("LLM_API_KEY")),
+        "apifyTokenSet": bool(os.getenv("APIFY_TOKEN")),
     }
 
 
@@ -108,5 +111,36 @@ async def parse_intent_route(request: Request, body: IntentRequest) -> Any:
     except intent_stage.LLMError as e:
         print("LLM unusable response:", e)
         return JSONResponse({"error": str(e)}, status_code=502)
+
+    return {**result, "ms": round((time.perf_counter() - started) * 1000)}
+
+
+class TrendsRequest(BaseModel):
+    sources: list[Literal["reddit", "youtube", "tiktok", "instagram"]] = Field(
+        min_length=1, max_length=3
+    )
+    topic: str = Field(default="general tech", max_length=100)
+    timeframe: Literal["today", "week", "month"] = "week"
+
+
+@app.post("/api/trends")
+async def get_trends(request: Request, body: TrendsRequest) -> Any:
+    started = time.perf_counter()
+    # drop duplicates, keep order
+    sources = [str(s) for s in dict.fromkeys(body.sources)]
+    try:
+        result = await trends_data.fetch_trends(
+            request.app.state.http, sources, body.topic, body.timeframe
+        )
+    except trends_data.MissingApiKey as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    if not any(s["items"] for s in result["sources"]):
+        reasons = "; ".join(f"{s}: {m}" for s, m in result["errors"].items())
+        return JSONResponse(
+            {"error": f"No trends came back. {reasons}".strip(),
+             "errors": result["errors"]},
+            status_code=502,
+        )
 
     return {**result, "ms": round((time.perf_counter() - started) * 1000)}

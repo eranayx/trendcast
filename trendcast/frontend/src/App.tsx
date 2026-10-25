@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
-import { parseIntent, transcribe, type Intent } from "./api";
+import {
+    fetchTrends,
+    parseIntent,
+    transcribe,
+    type Intent,
+    type Source,
+    type Trends,
+} from "./api";
 import { useRecorder } from "./hooks/useRecorder";
 import "./css/intent.css";
 
-type Phase = "idle" | "transcribing" | "thinking";
+type Phase = "idle" | "transcribing" | "thinking" | "fetching";
 
 const MIN_CLIP_MS = 350;
 
@@ -11,6 +18,14 @@ const STATUS_BY_PHASE: Record<Phase, string> = {
     idle: "Ready",
     transcribing: "Transcribing…",
     thinking: "Working out what you asked…",
+    fetching: "Pulling the latest data…",
+};
+
+const SOURCE_LABELS: Record<Source, string> = {
+    reddit: "Reddit",
+    youtube: "YouTube",
+    tiktok: "TikTok",
+    instagram: "Instagram",
 };
 
 export default function App() {
@@ -18,6 +33,7 @@ export default function App() {
     const [phase, setPhase] = useState<Phase>("idle");
     const [transcript, setTranscript] = useState("");
     const [intent, setIntent] = useState<Intent | null>(null);
+    const [trends, setTrends] = useState<Trends | null>(null);
     const [meta, setMeta] = useState("");
     const [error, setError] = useState<string | null>(null);
 
@@ -33,6 +49,7 @@ export default function App() {
 
         setError(null);
         setIntent(null);
+        setTrends(null);
         setMeta("");
         setPhase("transcribing");
         try {
@@ -52,8 +69,20 @@ export default function App() {
             const intentMs = Math.round(performance.now() - t1);
 
             setIntent(parsed);
-            setMeta(`speech to text ${sttMs} ms · intent ${intentMs} ms`);
-            // Next stage hooks in here: fetch data for parsed.sources / parsed.topic.
+            let summary = `speech to text ${sttMs} ms · intent ${intentMs} ms`;
+            setMeta(summary);
+
+            if (parsed.kind === "trends") {
+                setPhase("fetching");
+                const t2 = performance.now();
+                const data = await fetchTrends(parsed);
+                const dataMs = Math.round(performance.now() - t2);
+
+                setTrends(data);
+                summary += ` · data ${dataMs} ms`;
+                setMeta(summary);
+                // Next stage hooks in here: send `data` to the LLM to write a spoken summary.
+            }
         } catch (e) {
             setError(e instanceof Error ? e.message : "Something went wrong.");
         } finally {
@@ -91,7 +120,7 @@ export default function App() {
     const status =
         micError ?? error ?? (recording ? "Recording" : STATUS_BY_PHASE[phase]);
     const isError = Boolean(micError ?? error);
-
+    
     return (
         <main className="app">
             <h1>TrendCast</h1>
@@ -143,11 +172,71 @@ export default function App() {
                             <div className="label">
                                 {intent.kind === "smalltalk"
                                     ? "TrendCast says"
-                                    : "Can't help with that"}
+                                    : "Can\u2019t help with that"}
                             </div>
                             <div className="unsupported">{intent.reply}</div>
                         </>
                     )}
+                </section>
+            )}
+
+            {trends && (
+                <section className="trends" aria-label="Trending now">
+                    {trends.sources.map((s) => (
+                        <div key={s.source} className="source-block">
+                            <div className="label">
+                                {SOURCE_LABELS[s.source]}
+                                {s.cached ? " · cached" : ""}
+                            </div>
+                            
+                            {s.items.length === 0 && (
+                                <div className="note">No results.</div>
+                            )}
+                            <ol className="trend-list">
+                                {s.items.map((item) => (
+                                    <li
+                                        key={`${item.source}-${item.url ?? item.title}`}>
+                                        {item.url ? (
+                                            <a
+                                                className="trend-title"
+                                                href={item.url}
+                                                target="_blank"
+                                                rel="noreferrer">
+                                                {item.title}
+                                            </a>
+                                        ) : (
+                                            <span className="trend-title">
+                                                {item.title}
+                                            </span>
+                                        )}
+                                        {(item.score !== null ||
+                                            item.comments !== null) && (
+                                            <div className="trend-meta">
+                                                {item.score !== null &&
+                                                    `${item.score.toLocaleString()} ${item.score_label}`}
+                                                {item.score !== null &&
+                                                    item.comments !== null &&
+                                                    " · "}
+                                                {item.comments !== null &&
+                                                    `${item.comments.toLocaleString()} comments`}
+                                            </div>
+                                        )}
+                                        {item.description && (
+                                            <div className="trend-desc">
+                                                {item.description}
+                                            </div>
+                                        )}
+                                    </li>
+                                ))}
+                            </ol>
+                        </div>
+                    ))}
+                    {Object.entries(trends.errors).map(([source, message]) => (
+                        <div key={source} className="note error">
+                            {SOURCE_LABELS[source as Source] ?? source}:{" "}
+                            {message}
+                        </div>
+                    ))}
                 </section>
             )}
 
