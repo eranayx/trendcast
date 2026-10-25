@@ -1,8 +1,16 @@
+"""TrendCast backend.
+
+Stage 1: audio in -> Cartesia STT -> transcript
+Stage 2: transcript -> LLM (Groq by default) -> structured intent
+"""
+
 import intent as intent_stage
 import trends_data
+import summarize as summarize_stage
 import cartesia_stt
+import cartesia_tts
 from pydantic import BaseModel, Field
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, File, Form, Request, UploadFile
 import os
@@ -20,10 +28,13 @@ MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
 if not os.getenv("CARTESIA_API_KEY"):
     print("WARNING: CARTESIA_API_KEY is not set. Copy .env.example to .env and fill it in.")
+if not os.getenv("CARTESIA_VOICE_ID"):
+    print("WARNING: CARTESIA_VOICE_ID is not set. /api/tts needs a voice ID from Cartesia.")
 if not os.getenv("LLM_API_KEY"):
     print("WARNING: LLM_API_KEY is not set. /api/intent will fail until you add it to .env.")
 if not os.getenv("APIFY_TOKEN"):
     print("WARNING: APIFY_TOKEN is not set. /api/trends will fail until you add it to .env.")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,6 +60,7 @@ async def health() -> Any:
     return {
         "ok": True,
         "cartesiaKeySet": bool(os.getenv("CARTESIA_API_KEY")),
+        "cartesiaVoiceSet": bool(os.getenv("CARTESIA_VOICE_ID")),
         "llmKeySet": bool(os.getenv("LLM_API_KEY")),
         "apifyTokenSet": bool(os.getenv("APIFY_TOKEN")),
     }
@@ -144,3 +156,76 @@ async def get_trends(request: Request, body: TrendsRequest) -> Any:
         )
 
     return {**result, "ms": round((time.perf_counter() - started) * 1000)}
+
+
+class SummarizeItem(BaseModel):
+    title: str = Field(max_length=300)
+    text: str = Field(max_length=4000)
+
+
+class SummarizeSource(BaseModel):
+    source: Literal["reddit", "youtube", "instagram"]
+    items: list[SummarizeItem] = Field(max_length=8)
+
+
+class SummarizeRequest(BaseModel):
+    topic: str = Field(default="general tech", max_length=100)
+    timeframe: Literal["today", "week", "month"] = "week"
+    sources: list[SummarizeSource] = Field(min_length=1, max_length=3)
+
+
+@app.post("/api/summarize")
+async def summarize_route(request: Request, body: SummarizeRequest) -> Any:
+    started = time.perf_counter()
+    try:
+        summary = await summarize_stage.summarize(
+            request.app.state.http,
+            body.topic,
+            body.timeframe,
+            [s.model_dump() for s in body.sources],
+        )
+    except summarize_stage.MissingApiKey as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text
+        print("LLM error", e.response.status_code, detail)
+        return JSONResponse(
+            {"error": f"LLM provider returned {e.response.status_code}", "detail": detail},
+            status_code=502,
+        )
+    except httpx.HTTPError as e:
+        print("LLM network error:", repr(e))
+        return JSONResponse({"error": "Could not reach the LLM provider."}, status_code=502)
+    except summarize_stage.LLMError as e:
+        print("LLM unusable response:", e)
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+    return {"summary": summary, "ms": round((time.perf_counter() - started) * 1000)}
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=5000)
+
+
+@app.post("/api/tts")
+async def tts_route(request: Request, body: TTSRequest) -> Any:
+    try:
+        upstream = await cartesia_tts.open_stream(request.app.state.http, body.text)
+    except cartesia_tts.MissingConfiguration as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    except httpx.HTTPStatusError as e:
+        detail = e.response.text
+        print("Cartesia TTS error", e.response.status_code, detail)
+        return JSONResponse(
+            {"error": f"Cartesia returned {e.response.status_code}", "detail": detail},
+            status_code=502,
+        )
+    except httpx.HTTPError as e:
+        print("Cartesia TTS network error:", repr(e))
+        return JSONResponse({"error": "Could not reach Cartesia."}, status_code=502)
+
+    return StreamingResponse(
+        cartesia_tts.audio_chunks(upstream),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )

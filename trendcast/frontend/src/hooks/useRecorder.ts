@@ -60,6 +60,8 @@ export function useRecorder() {
 
         // The user may have released the button while the permission prompt was open.
         if (stopRequestedRef.current) {
+            streamRef.current.getTracks().forEach((track) => track.stop());
+            streamRef.current = null;
             startingRef.current = false;
             return;
         }
@@ -94,6 +96,8 @@ export function useRecorder() {
                 const blob = new Blob(chunksRef.current, {
                     type: recorder.mimeType || "audio/webm",
                 });
+                streamRef.current?.getTracks().forEach((track) => track.stop());
+                streamRef.current = null;
                 resolve(blob.size > 0 ? { blob, durationMs } : null);
             };
             recorder.stop();

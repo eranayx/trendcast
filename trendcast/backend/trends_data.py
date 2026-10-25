@@ -1,28 +1,41 @@
 """Stage 3: fetch trending data from Apify actors, with a small in-memory cache.
 
-Each source maps to one Apify actor. We run the actor synchronously, normalize its
-output into one shape, and keep results for a few minutes so repeat questions are instant.
+Each source maps to one Apify actor. We run it synchronously and turn its output into
+plain-text documents (post + top comments, description + transcript, ...) that the next
+stage feeds to the LLM. Results are cached for a few minutes so repeat questions are instant.
 """
 import asyncio
 import os
+import re
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 
 APIFY_BASE = "https://api.apify.com/v2"
 CACHE_TTL_SECONDS = int(os.getenv("TRENDS_CACHE_TTL", "900"))  # 15 minutes
-ITEMS_PER_SOURCE = 8
-ACTOR_RUN_TIMEOUT = 75  # seconds Apify may spend on a single run
+ITEMS_PER_SOURCE = 5
+# seconds Apify may spend on a single run (a timeout returns nothing, so don't go too low)
+ACTOR_RUN_TIMEOUT = 30
 
 GENERIC_TOPICS = {"", "general tech", "tech", "technology", "tech news"}
 
+# Reddit only: if a narrow window finds nothing, try the next one once.
+WIDER_TIMEFRAME = {"today": "week", "week": "month"}
 REDDIT_TIME = {"today": "day", "week": "week", "month": "month"}
 YOUTUBE_DATE = {"today": "today", "week": "week", "month": "month"}
-TIKTOK_DATE = {"today": "PAST_24_HOURS",
-               "week": "PAST_WEEK", "month": "PAST_MONTH"}
 
-DESC_CHAR_LIMIT = 250
+# How much text each source contributes to the LLM context (characters).
+REDDIT_COMMENTS_PER_POST = 3
+REDDIT_BODY_CHARS = 600
+REDDIT_COMMENT_CHARS = 200
+YOUTUBE_DESC_CHARS = 300
+YOUTUBE_TRANSCRIPT_CHARS = 1200
+INSTAGRAM_TRANSCRIPT_CHARS = 800
+# Instagram's own caption limit, so effectively the whole caption
+INSTAGRAM_CAPTION_CHARS = 2200
+INSTAGRAM_COMMENT_CHARS = 200
+INSTAGRAM_COMMENTS_SHOWN = 3
 
 
 class MissingApiKey(RuntimeError):
@@ -48,18 +61,31 @@ def _to_int(value: Any) -> int | None:
 
 def _clip(text: str, limit: int = 140) -> str:
     text = " ".join(text.split())  # collapse newlines and runs of spaces
-    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "..."
+
+
+def _trim(text: str, limit: int) -> str:
+    """Cut long text but keep its line breaks."""
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+def _one_line(text: Any) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _fmt(value: int | None, label: str) -> str:
+    return f"{value:,} {label}" if value is not None else ""
+
+
+def _stats_line(*parts: str) -> str:
+    return " · ".join(p for p in parts if p)
 
 
 def _make_structured_item(
-    source: str,
-    title: Any,
-    url: Any = None,
-    score: int | None = None,
-    score_label: str = "",
-    comments: int | None = None,
-    description: str = "",
+    source: str, title: Any, url: Any, text: str
 ) -> dict[str, Any] | None:
+    """One result. `text` is exactly what the LLM will read for this post/video."""
     title = str(title or "").strip()
     if not title:
         return None
@@ -67,71 +93,119 @@ def _make_structured_item(
         "source": source,
         "title": title,
         "url": str(url) if url else None,
-        "score": score,
-        "score_label": score_label if score is not None else "",
-        "comments": comments,
-        "description": (description or "").strip()[:DESC_CHAR_LIMIT],
+        "text": text.strip(),
     }
+
+
+def _per_item(
+    fn: Callable[[dict[str, Any]], dict[str, Any] | None],
+) -> Callable[[list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Turn a one-record normalizer into one that takes the whole list."""
+    def run(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [e for e in (fn(it) for it in raw) if e]
+    return run
+
+
+# Subtitle files (SRT from YouTube, WebVTT from TikTok) share the same cue layout:
+#   [number]\n00:00:01,000 --> 00:00:03,000\ncaption text\n\n
+_CUE_TIMESTAMP = re.compile(
+    r"(?:\d+:)?\d+:\d+[,.]\d+\s*-->\s*(?:\d+:)?\d+:\d+[,.]\d+")
+_MARKUP_TAGS = re.compile(r"<[^>]+>")
+
+
+def _cues_to_text(raw: str) -> str:
+    """Keep only the caption text: no cue numbers, timestamps, markup or repeated lines."""
+    parts: list[str] = []
+    in_cue = False  # True between a cue's timestamp line and the blank line that ends it
+    for raw_line in raw.splitlines():
+        line = _MARKUP_TAGS.sub("", raw_line).strip()
+        if _CUE_TIMESTAMP.search(line):
+            in_cue = True
+        elif not line:
+            in_cue = False  # blank line (or a " " filler cue) ends the cue
+        elif in_cue:
+            if line.startswith("- "):  # dialogue dash
+                line = line[2:]
+            # auto captions repeat lines
+            if line and (not parts or parts[-1] != line):
+                parts.append(line)
+    return " ".join(parts)
+
+
+def _clean_srt_subtitles(subtitle_data: Any) -> str:
+    """YouTube: flatten the actor's `subtitles` list into plain transcript text."""
+    if not isinstance(subtitle_data, list):
+        return ""
+    tracks = [t for t in subtitle_data if isinstance(
+        t, dict) and isinstance(t.get("srt"), str)]
+    if not tracks:
+        return ""
+    track = next((t for t in tracks if t.get("language") == "en"), tracks[0])
+    return _cues_to_text(track["srt"])
 
 
 # ------------------------------------------------- per-source input + output
 
+# ---- Reddit: post text + top comments
+
 def _reddit_input(topic: str, timeframe: str, count: int) -> dict[str, Any]:
     window = REDDIT_TIME[timeframe]
-
+    query = "technology" if _is_generic(topic) else topic
     return {
-        "subredditName": "technology",
-        "subredditTimeframe": window,
-        "scrapeComments": True,
-        "maxPosts": count,
-        "maxComments": 5,
-    } if _is_generic(topic) else {
-        "queries": [topic],
+        "queries": [query],
+        "sort": "top",
         "timeframe": window,
         "scrapeComments": True,
         "maxPosts": count,
-        "maxComments": 5,
+        "maxComments": REDDIT_COMMENTS_PER_POST,
     }
 
 
-def _norm_reddit(item: dict[str, Any]) -> dict[str, Any] | None:
-    subreddit = str(item.get("subreddit") or "")
-    body = str(item.get("body") or "")
-    return _make_structured_item(
-        "reddit",
-        item.get("title"),
-        item.get("url"),
-        _to_int(item.get("score")),
-        "upvotes",
-        _to_int(item.get("num_comments")),
-        f"r/{subreddit}: {body}" if subreddit else body,
-    )
+def _norm_reddit(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Posts and comments arrive as separate records; attach each comment to its post."""
+    comments_by_post: dict[str, list[dict[str, Any]]] = {}
+    for rec in raw:
+        if rec.get("kind") == "comment" and rec.get("postId"):
+            comments_by_post.setdefault(str(rec["postId"]), []).append(rec)
 
-
-def _clean_srt_subtitles(subtitle_data: list[dict]) -> str:
-    # Extract the raw srt string from the dictionary inside the list
-    raw_srt = subtitle_data[0].get('srt', '')
-
-    # Remove lines containing only numbers (index) or timestamps (00:00:00 --> 00:00:00)
-    cleaned_lines = []
-    for line in raw_srt.split('\n'):
-        line = line.strip()
-
-        # Skip empty lines, numeric line counts, and timestamp arrows
-        if not line or line.isdigit() or '-->' in line:
+    items: list[dict[str, Any]] = []
+    for rec in raw:
+        # anything else counts as a post, whatever the actor calls it
+        if rec.get("kind") == "comment":
             continue
+        comments = [
+            c for c in comments_by_post.get(str(rec.get("id")), [])
+            if str(c.get("body") or "").strip() not in ("", "[deleted]", "[removed]")
+        ]
+        # The actor doesn't document its comment order, so sort by score ourselves.
+        comments.sort(key=lambda c: _to_int(c.get("score")) or 0, reverse=True)
 
-        # Clean up dialogue hyphens at the start of a line if present
-        if line.startswith('- '):
-            line = line[2:]
-        elif line.startswith('-'):
-            line = line[1:]
+        subreddit = str(rec.get("subreddit") or "")
+        lines = [
+            _stats_line(
+                f"r/{subreddit}" if subreddit else "",
+                _fmt(_to_int(rec.get("score")), "upvotes"),
+                _fmt(_to_int(rec.get("num_comments")), "comments"),
+            ),
+            "",
+            _trim(str(rec.get("body") or ""),
+                  REDDIT_BODY_CHARS) or "(link post, no text)",
+        ]
+        if comments:
+            lines += ["", "Top comments:"]
+            for c in comments[:REDDIT_COMMENTS_PER_POST]:
+                votes = _fmt(_to_int(c.get("score")), "upvotes")
+                prefix = f"- ({votes}) " if votes else "- "
+                lines.append(
+                    prefix + _trim(_one_line(c.get("body")), REDDIT_COMMENT_CHARS))
+        item = _make_structured_item("reddit", rec.get(
+            "title"), rec.get("url"), "\n".join(lines))
+        if item:
+            items.append(item)
+    return items
 
-        cleaned_lines.append(line)
 
-    # Join everything into a single block of text
-    return " ".join(cleaned_lines)
-
+# ---- YouTube: description + transcript
 
 def _youtube_input(topic: str, timeframe: str, count: int) -> dict[str, Any]:
     return {
@@ -147,50 +221,23 @@ def _youtube_input(topic: str, timeframe: str, count: int) -> dict[str, Any]:
 def _norm_youtube(item: dict[str, Any]) -> dict[str, Any] | None:
     if item.get("error"):
         return None
-    channel = item.get("channelName", "")
-    description = item.get("text", "")
-    subtitles = _clean_srt_subtitles(item.get("subtitles") or [{}])
-
-    return _make_structured_item(
-        "youtube",
-        item.get("title"),
-        item.get("url"),
-        _to_int(item.get("viewCount")),
-        "views",
-        _to_int(item.get("commentsCount")),
-        f"{channel}: {description} | {subtitles}",
+    # `or ""` matters: the key can exist with a null value, which .get(key, "") would return as None.
+    description = _trim(str(item.get("text") or ""), YOUTUBE_DESC_CHARS)
+    transcript = _trim(_clean_srt_subtitles(
+        item.get("subtitles")), YOUTUBE_TRANSCRIPT_CHARS)
+    header = _stats_line(
+        str(item.get("channelName") or ""),
+        _fmt(_to_int(item.get("viewCount")), "views"),
+        _fmt(_to_int(item.get("commentsCount")), "comments"),
     )
+    text = "\n".join([
+        header, "",
+        "Description:", description or "(none)", "",
+        "Transcript:", transcript or "(none available)",
+    ])
+    return _make_structured_item("youtube", item.get("title"), item.get("url"), text)
 
-
-def _tiktok_input(topic: str, timeframe: str, count: int) -> dict[str, Any]:
-    return {
-        "searchQueries": ["tech" if _is_generic(topic) else topic],
-        "searchSection": "/video",
-        "videoSearchSorting": "MOST_LIKED",
-        "videoSearchDateFilter": TIKTOK_DATE[timeframe],
-        "resultsPerPage": count,
-    }
-
-
-def _norm_tiktok(item: dict[str, Any]) -> dict[str, Any] | None:
-    if item.get("error"):
-        return None  # the actor reports unscrapable inputs as error items
-    author_meta = item.get("authorMeta")
-    # Nested in the JSON API, but the Apify console shows it flattened as "authorMeta.name".
-    author = (author_meta.get("name") if isinstance(
-        author_meta, dict) else None) or item.get("authorMeta.name")
-    likes = _to_int(item.get("diggCount"))
-    parts = [f"@{author}" if author else "",
-             f"{likes:,} likes" if likes is not None else ""]
-    return _make_structured_item(
-        "tiktok",
-        _clip(str(item.get("text") or "")),
-        item.get("webVideoUrl"),
-        _to_int(item.get("playCount")),
-        "plays",
-        _to_int(item.get("commentCount")),
-        " · ".join(p for p in parts if p),
-    )
+# ---- Instagram: caption + transcript (reels) + comments
 
 
 def _hashtag(topic: str) -> str:
@@ -205,51 +252,80 @@ def _instagram_input(topic: str, timeframe: str, count: int) -> dict[str, Any]:
     return {"hashtags": [_hashtag(topic)], "resultsType": "posts", "resultsLimit": count}
 
 
-def _norm_instagram(it: dict[str, Any]) -> dict[str, Any] | None:
-    owner = str(it.get("ownerUsername") or "")
-    caption = _clip(str(it.get("caption") or ""))
-    plays = _to_int(it.get("videoPlayCount"))
-    likes = _to_int(it.get("likesCount"))
-    comments = it.get("latestComments")
+_TRAILING_HASHTAGS = re.compile(r"(?:\s*#\w+)+\s*$")
+
+def _strip_trailing_hashtags(caption: str) -> str:
+    """Drop the hashtag wall at the end of a caption (hashtags inside sentences stay)."""
+    return _TRAILING_HASHTAGS.sub("", caption).strip()
+
+
+def _comment_texts(item: dict[str, Any]) -> list[str]:
+    found: list[str] = []
+    latest = item.get("latestComments")
+    if isinstance(latest, list):
+        for c in latest:
+            body = c.get("text") if isinstance(c, dict) else c
+            if isinstance(body, str) and body.strip():
+                found.append(_trim(_one_line(body), INSTAGRAM_COMMENT_CHARS))
+    first = item.get("firstComment")
+    if not found and isinstance(first, str) and first.strip():
+        found.append(_trim(_one_line(first), INSTAGRAM_COMMENT_CHARS))
+    return found[:INSTAGRAM_COMMENTS_SHOWN]
+
+
+def _norm_instagram(item: dict[str, Any]) -> dict[str, Any] | None:
+    caption = _strip_trailing_hashtags(str(item.get("caption") or ""))
+    likes = _to_int(item.get("likesCount"))
     if likes is not None and likes < 0:
         likes = None  # hidden like counts come back as -1
-    score, label = (plays, "plays") if plays else (likes, "likes")
+    comments = _comment_texts(item)
+
+    # The poster's username is deliberately left out: the LLM can't repeat what it never sees.
+    lines = [
+        _stats_line(
+            _fmt(_to_int(item.get("videoPlayCount")), "plays"),
+            _fmt(likes, "likes"),
+            _fmt(_to_int(item.get("commentsCount")), "comments"),
+        ),
+        "",
+        "Caption:", _trim(caption, INSTAGRAM_CAPTION_CHARS) or "(none)",
+    ]
+    if comments:
+        lines += ["", "Comments:"] + [f"- {c}" for c in comments]
     return _make_structured_item(
         "instagram",
-        caption or (f"Post by @{owner}" if owner else ""),
-        it.get("url"),
-        score,
-        label,
-        _to_int(it.get("commentsCount")),
-        f"@{owner} | " if owner else "",
+        _clip(caption) or "Instagram post",
+        item.get("url"),
+        "\n".join(lines),
     )
 
 
-# `fetch` = how many items to pull from the actor (this is what you pay for)
+# `fetch`  = how many items to pull from the actor (this is what you pay for)
+# `limit`  = max dataset records to download (Reddit needs room for posts AND their comments)
+# `enrich` = optional async step that adds extra text (subtitles, transcripts) to the raw records
+# `norm`   = turns the raw records into [{source, title, url, text}]
 SOURCES: dict[str, dict[str, Any]] = {
     "reddit": {
         "actor": "fatihtahta~reddit-scraper-search-fast",
-        "fetch": 10,
+        "fetch": 6,
+        "timeout": 120,
+        "limit": 6 * (1 + REDDIT_COMMENTS_PER_POST),
         "build": _reddit_input,
         "norm": _norm_reddit,
     },
     "youtube": {
         "actor": "streamers~youtube-scraper",
-        "fetch": 10,
-        "build": _youtube_input,
-        "norm": _norm_youtube,
-    },
-    "tiktok": {
-        "actor": "clockworks~tiktok-scraper",
         "fetch": 5,
-        "build": _tiktok_input,
-        "norm": _norm_tiktok,
+        "timeout": 75,  # transcripts make this the slow one; the log line shows the real time
+        "build": _youtube_input,
+        "norm": _per_item(_norm_youtube),
     },
     "instagram": {
         "actor": "apify~instagram-hashtag-scraper",
-        "fetch": 10,
+        "fetch": 5,
+        "timeout": 45,
         "build": _instagram_input,
-        "norm": _norm_instagram,
+        "norm": _per_item(_norm_instagram),
     },
 }
 
@@ -260,15 +336,19 @@ _cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
 
 
 async def _run_actor(
-    client: httpx.AsyncClient, actor: str, payload: dict[str, Any], limit: int
+    client: httpx.AsyncClient,
+    actor: str,
+    payload: dict[str, Any],
+    limit: int,
+    timeout: int = ACTOR_RUN_TIMEOUT,
 ) -> list[Any]:
     r = await client.post(
         f"{APIFY_BASE}/acts/{actor}/run-sync-get-dataset-items",
         headers={"Authorization": f"Bearer {os.getenv('APIFY_TOKEN')}"},
-        params={"timeout": ACTOR_RUN_TIMEOUT, "limit": limit, "clean": "true"},
+        params={"timeout": timeout, "limit": limit, "clean": "true"},
         json=payload,
         # the shared client's 30 s default is too short here
-        timeout=ACTOR_RUN_TIMEOUT + 20,
+        timeout=timeout + 20,
     )
     r.raise_for_status()
     data = r.json()
@@ -287,15 +367,34 @@ async def fetch_source(
     actor = os.getenv(f"APIFY_ACTOR_{source.upper()}", source_details["actor"])
     payload = source_details["build"](
         topic, timeframe, source_details["fetch"])
-    raw = await _run_actor(client, actor, payload, source_details["fetch"])
-
+    limit = source_details.get("limit", source_details["fetch"])
+    timeout = source_details.get("timeout", ACTOR_RUN_TIMEOUT)
+    run_started = time.monotonic()
+    try:
+        raw = [r for r in await _run_actor(client, actor, payload, limit, timeout) if isinstance(r, dict)]
+    finally:  # logged even when the run times out, so you can see how close to the limit it is
+        print(
+            f"[apify:{source}] actor took {time.monotonic() - run_started:.1f}s (limit {timeout}s)")
     if os.getenv("APIFY_DEBUG"):
         print(f"[apify:{source}] {len(raw)} raw items, first: {raw[:1]}")
 
-    norm: Callable[[dict[str, Any]], dict[str, Any]
-                   | None] = source_details["norm"]
-    items = [e for e in (norm(item) for item in raw if isinstance(
-        item, dict)) if e][:ITEMS_PER_SOURCE]
+    enrich: Callable[[httpx.AsyncClient, list[dict[str, Any]]],
+                     Awaitable[None]] | None = source_details.get("enrich")
+    if enrich:
+        await enrich(client, raw)
+
+    norm: Callable[[list[dict[str, Any]]],
+                   list[dict[str, Any]]] = source_details["norm"]
+    items = norm(raw)[:ITEMS_PER_SOURCE]
+
+    if not items:
+        kinds = sorted({str(r.get("kind")) for r in raw})
+        print(f"[apify:{source}] 0 items from {len(raw)} raw records (kinds: {kinds}) "
+              f"for topic={topic!r} timeframe={timeframe!r}; payload was {payload}")
+        wider = WIDER_TIMEFRAME.get(timeframe)
+        if source == "reddit" and wider:
+            print(f"[apify:reddit] retrying with timeframe={wider!r}")
+            return await fetch_source(client, source, topic, wider)
 
     if items:  # never cache an empty result; it may be a failed scrape
         _cache[key] = (time.monotonic(), items)
